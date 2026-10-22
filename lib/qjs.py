@@ -2,6 +2,16 @@ import ctypes
 import os
 import platform
 
+# Shared libqjs that the per-platform qjswrapper.* links against.  The wrapper
+# binaries are kept small/dynamic on desktop OSes, so the dependency library
+# must be shipped next to them and pre-loaded before the wrapper is loaded.
+_WRAPPER_PLATFORMS = {
+    'windows_x86_64': ('qjs.dll',),
+    'linux_x86_64': ('libqjs.so.0', 'libqjs.so'),
+    'darwin_x86_64': ('libqjs.0.dylib', 'libqjs.dylib'),
+}
+
+
 def get_lib_path():
     base_dir = os.path.dirname(os.path.abspath(__file__))
     system = platform.system().lower()
@@ -24,12 +34,50 @@ def get_lib_path():
         
     return None
 
+
+def get_platform_dir():
+    """Return the directory name of the wrapper selected for this host."""
+    lib_path = get_lib_path()
+    if not lib_path:
+        return None
+    return os.path.basename(os.path.dirname(lib_path))
+
+
+def _preload_dependency_library(wrapper_path):
+    """Load the shared libqjs that the wrapper links against, if shipped here."""
+    directory = os.path.dirname(wrapper_path)
+    platform_dir = os.path.basename(directory)
+    candidates = _WRAPPER_PLATFORMS.get(platform_dir)
+    if not candidates:
+        # Android/arm builds are statically linked - nothing to pre-load.
+        return
+    if hasattr(os, 'add_dll_directory'):
+        try:
+            os.add_dll_directory(directory)
+        except OSError:
+            pass
+    for name in candidates:
+        dependency_path = os.path.join(directory, name)
+        if not os.path.exists(dependency_path):
+            continue
+        try:
+            if platform.system().lower() == 'windows':
+                ctypes.CDLL(dependency_path)
+            else:
+                ctypes.CDLL(dependency_path, mode=getattr(ctypes, 'RTLD_GLOBAL', 0))
+        except OSError:
+            # Leave it to the wrapper load to raise a meaningful error.
+            pass
+        return
+
+
 class QuickJS:
     def __init__(self):
         lib_path = get_lib_path()
         if not lib_path or not os.path.exists(lib_path):
             raise Exception("Unsupported platform or missing QuickJS library: %s" % lib_path)
         
+        _preload_dependency_library(lib_path)
         self.lib = ctypes.cdll.LoadLibrary(lib_path)
         
         # Setup eval_js_wrapper signature

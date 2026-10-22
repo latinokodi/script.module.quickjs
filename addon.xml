@@ -1,5 +1,5 @@
 <?xml version='1.0' encoding='utf-8'?>
-<addon id="script.module.quickjs" name="QuickJS Engine" version="1.0.1" provider-name="tclquick">
+<addon id="script.module.quickjs" name="QuickJS Engine" version="1.0.4" provider-name="tclquick">
   <requires>
     <import addon="xbmc.python" version="3.0.0" />
   </requires>
@@ -8,5 +8,9 @@
     <summary lang="en_GB">QuickJS wrapper for Kodi</summary>
     <description lang="en_GB">Provides a Python ctypes wrapper around the QuickJS Javascript Engine, compiled as a shared library to bypass Android exec restrictions.</description>
     <platform>all</platform>
+    <assets>
+      <icon>icon.png</icon>
+      <fanart>fanart.jpg</fanart>
+    </assets>
   </extension>
 </addon>
