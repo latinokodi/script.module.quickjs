@@ -1,0 +1,280 @@
+name: Build native QuickJS libraries
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "lib/qjs.py"
+      - "addon.xml"
+      - ".github/workflows/build-native.yml"
+      - ".github/scripts/load_test.py"
+  pull_request:
+    paths:
+      - "src/**"
+      - "lib/qjs.py"
+      - "addon.xml"
+      - ".github/workflows/build-native.yml"
+      - ".github/scripts/load_test.py"
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: native-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # quickjs-ng v0.15.1 - keep in sync with the version embedded in libqjs.
+  QUICKJS_REF: fd0a0210b7be00957751871e7e01b8291268fc29
+
+jobs:
+  build:
+    name: build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows_x86_64
+            host: windows
+          - os: ubuntu-22.04
+            platform: linux_x86_64
+            host: linux
+          - os: macos-latest
+            platform: darwin_x86_64
+            host: macos
+          - os: ubuntu-22.04
+            platform: android_arm64
+            host: android
+            android_abi: arm64-v8a
+          - os: ubuntu-22.04
+            platform: android_armv7
+            host: android
+            android_abi: armeabi-v7a
+    steps:
+      - uses: actions/checkout@v4
+
+      # src/CMakeLists.txt resolves quickjs as ../../quickjs, i.e. a sibling of
+      # the checked-out repo. Reproduce that layout in the runner workspace.
+      - name: Checkout quickjs-ng
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$GITHUB_WORKSPACE/../quickjs"
+          git clone --quiet https://github.com/quickjs-ng/quickjs.git "$GITHUB_WORKSPACE/../quickjs"
+          git -C "$GITHUB_WORKSPACE/../quickjs" checkout --quiet "$QUICKJS_REF"
+
+      - name: Set up MSVC developer environment (Windows)
+        if: matrix.host == 'windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure and build (Windows)
+        if: matrix.host == 'windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            choco install ninja -y --no-progress
+          }
+          cmake -S src -B build -G Ninja -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --target qjswrapper --parallel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Configure and build (Linux / macOS)
+        if: matrix.host == 'linux' || matrix.host == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(-S src -B build -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release)
+          if [ "${{ matrix.host }}" = "linux" ]; then
+            args+=(-DCMAKE_INSTALL_RPATH='$ORIGIN' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON)
+          else
+            args+=(-DCMAKE_OSX_ARCHITECTURES=x86_64
+                   -DCMAKE_INSTALL_NAME_DIR=@loader_path
+                   -DCMAKE_BUILD_WITH_INSTALL_NAME_DIR=ON)
+          fi
+          cmake "${args[@]}"
+          cmake --build build --target qjswrapper --parallel
+
+      - name: Configure and build (Android)
+        if: matrix.host == 'android'
+        shell: bash
+        run: |
+          set -euo pipefail
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [ -z "${NDK}" ] || [ ! -d "${NDK}" ]; then
+            NDK="$(ls -d "${ANDROID_HOME}"/ndk/* 2>/dev/null | sort -V | tail -1 || true)"
+          fi
+          if [ -z "${NDK}" ] || [ ! -d "${NDK}" ]; then
+            echo "NDK not present, installing via sdkmanager"
+            yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" "ndk;26.1.10909125" >/dev/null
+            NDK="${ANDROID_HOME}/ndk/26.1.10909125"
+          fi
+          echo "Using NDK: ${NDK}"
+          cmake -S src -B build \
+            -DCMAKE_TOOLCHAIN_FILE="${NDK}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="${{ matrix.android_abi }}" \
+            -DANDROID_PLATFORM=android-21 \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target qjswrapper --parallel
+
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="out/${{ matrix.platform }}"
+          mkdir -p "${out}"
+          case "${{ matrix.host }}" in
+            windows)
+              cp -v "$(find build -type f -name qjs.dll | head -1)" "${out}/qjs.dll"
+              cp -v "$(find build -type f -name qjswrapper.dll | head -1)" "${out}/qjswrapper.dll"
+              ;;
+            linux)
+              cp -Lv build/quickjs_build/libqjs.so.0 "${out}/libqjs.so.0"
+              cp -Lv build/libqjswrapper.so "${out}/libqjswrapper.so"
+              ;;
+            macos)
+              cp -Lv build/quickjs_build/libqjs.0.dylib "${out}/libqjs.0.dylib"
+              cp -Lv build/libqjswrapper.dylib "${out}/libqjswrapper.dylib"
+              install_name_tool -id "@loader_path/libqjs.0.dylib" "${out}/libqjs.0.dylib"
+              current="$(otool -L "${out}/libqjswrapper.dylib" | awk '/libqjs/{print $1; exit}')"
+              if [ -n "${current}" ] && [ "${current}" != "@loader_path/libqjs.0.dylib" ]; then
+                install_name_tool -change "${current}" "@loader_path/libqjs.0.dylib" \
+                  "${out}/libqjswrapper.dylib"
+              fi
+              ;;
+            android)
+              cp -Lv build/libqjswrapper.so "${out}/libqjswrapper.so"
+              ;;
+          esac
+
+      - name: Verify (Windows runtime)
+        if: matrix.host == 'windows'
+        shell: pwsh
+        run: python .github/scripts/load_test.py "out/${{ matrix.platform }}"
+
+      - name: Verify (Linux runtime)
+        if: matrix.host == 'linux'
+        shell: bash
+        run: python3 .github/scripts/load_test.py "out/${{ matrix.platform }}"
+
+      - name: Verify (macOS structural - x86_64 is cross-built on the arm64 runner)
+        if: matrix.host == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="out/${{ matrix.platform }}"
+          file "${out}"/*
+          lipo -info "${out}/libqjswrapper.dylib" | grep -q x86_64
+          lipo -info "${out}/libqjs.0.dylib" | grep -q x86_64
+          otool -L "${out}/libqjswrapper.dylib" | grep -q "@loader_path/libqjs.0.dylib"
+          otool -D "${out}/libqjs.0.dylib" | grep -q "@loader_path/libqjs.0.dylib"
+
+      - name: Verify (Android self-contained)
+        if: matrix.host == 'android'
+        shell: bash
+        run: |
+          set -euo pipefail
+          so="out/${{ matrix.platform }}/libqjswrapper.so"
+          size=$(stat -c%s "${so}")
+          test "${size}" -gt 1000000
+          head -c4 "${so}" | od -An -tx1 | tr -d ' \n' | grep -q '7f454c46'
+          # The wrapper's own SONAME contains "libqjs" too, so match NEEDED only.
+          if readelf -d "${so}" | grep -E 'NEEDED.*libqjs\.so'; then
+            echo "Android wrapper still links against external libqjs"
+            exit 1
+          fi
+          echo "Android wrapper is self-contained (${size} bytes)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quickjs-${{ matrix.platform }}
+          path: out/${{ matrix.platform }}
+          if-no-files-found: error
+
+  package:
+    name: package addon
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: quickjs-*
+
+      - name: Install freshly built libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dir in artifacts/quickjs-*; do
+            platform="${dir#artifacts/quickjs-}"
+            rm -rf "lib/${platform}"
+            mkdir -p "lib/${platform}"
+            cp -Lv "${dir}"/* "lib/${platform}"/
+          done
+          ls -lR lib | head -80
+
+      - name: Generate checksums and package addon
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(python3 -c "import xml.etree.ElementTree as ET; print(ET.parse('addon.xml').getroot().get('version'))")
+          echo "VERSION=${version}" >> "$GITHUB_ENV"
+          (
+            cd lib
+            find . -type f \( -name '*.so*' -o -name '*.dylib' -o -name '*.dll' \) -print0 \
+              | sort -z | xargs -0 sha256sum > SHA256SUMS
+            sha256sum -c SHA256SUMS
+          )
+          dist="$GITHUB_WORKSPACE/dist"
+          mkdir -p "${dist}"
+          out="$RUNNER_TEMP/script.module.quickjs-${version}.zip"
+          (
+            cd ..
+            zip -qr "${out}" "$(basename "$GITHUB_WORKSPACE")" \
+              -x "*/build/*" "*/out/*" "*/artifacts/*" "*/dist/*" "*/__pycache__/*" "*/.git/*" "*/.github/*"
+          )
+          mv "${out}" "${dist}/"
+          cp lib/SHA256SUMS "${dist}/script.module.quickjs-${version}-SHA256SUMS.txt"
+
+      - name: Package Retro Latino vendor bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p retrolatino-native/native
+          for platform in windows_x86_64 linux_x86_64 darwin_x86_64; do
+            mkdir -p "retrolatino-native/native/${platform}"
+            cp -Lv "lib/${platform}"/* "retrolatino-native/native/${platform}"/
+          done
+          (cd retrolatino-native && zip -qr "$GITHUB_WORKSPACE/dist/retrolatino-native-bundles.zip" native)
+          ls -l "$GITHUB_WORKSPACE/dist"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quickjs-package
+          path: dist
+          if-no-files-found: error
+
+  release:
+    name: publish release assets
+    needs: package
+    if: github.event_name == 'release'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: quickjs-package
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

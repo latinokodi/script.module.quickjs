@@ -1,0 +1,17 @@
+# build outputs
+build/
+build-*/
+out/
+dist/
+artifacts/
+retrolatino-native/
+
+# python
+__pycache__/
+*.py[cod]
+
+# local editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
