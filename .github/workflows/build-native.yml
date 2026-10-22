@@ -69,14 +69,20 @@ jobs:
           git clone --quiet https://github.com/quickjs-ng/quickjs.git "$GITHUB_WORKSPACE/../quickjs"
           git -C "$GITHUB_WORKSPACE/../quickjs" checkout --quiet "$QUICKJS_REF"
 
+      - name: Set up MSVC developer environment (Windows)
+        if: matrix.host == 'windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Configure and build (Windows)
         if: matrix.host == 'windows'
         shell: pwsh
         run: |
-          cmake -S src -B build -G "Visual Studio 17 2022" -A x64 `
-            -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            choco install ninja -y --no-progress
+          }
+          cmake -S src -B build -G Ninja -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cmake --build build --config Release --target qjswrapper --parallel
+          cmake --build build --target qjswrapper --parallel
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Configure and build (Linux / macOS)
@@ -126,8 +132,8 @@ jobs:
           mkdir -p "${out}"
           case "${{ matrix.host }}" in
             windows)
-              cp -v build/quickjs_build/Release/qjs.dll "${out}/qjs.dll"
-              cp -v build/Release/qjswrapper.dll "${out}/qjswrapper.dll"
+              cp -v "$(find build -type f -name qjs.dll | head -1)" "${out}/qjs.dll"
+              cp -v "$(find build -type f -name qjswrapper.dll | head -1)" "${out}/qjswrapper.dll"
               ;;
             linux)
               cp -Lv build/quickjs_build/libqjs.so.0 "${out}/libqjs.so.0"
@@ -179,7 +185,8 @@ jobs:
           size=$(stat -c%s "${so}")
           test "${size}" -gt 1000000
           head -c4 "${so}" | od -An -tx1 | tr -d ' \n' | grep -q '7f454c46'
-          if readelf -d "${so}" | grep -q 'libqjs'; then
+          # The wrapper's own SONAME contains "libqjs" too, so match NEEDED only.
+          if readelf -d "${so}" | grep -E 'NEEDED.*libqjs\.so'; then
             echo "Android wrapper still links against external libqjs"
             exit 1
           fi
